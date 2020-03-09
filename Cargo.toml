@@ -8,7 +8,7 @@ repository = "https://github.com/marius851000/io_partition"
 readme = "Readme.md"
 keywords = [ "io", "concurrency" ]
 categories = [ "concurrency" ]
-license = "CC0"
+license = "CC0-1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
