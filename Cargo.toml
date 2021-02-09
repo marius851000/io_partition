@@ -1,6 +1,6 @@
 [package]
 name = "io_partition"
-version = "1.0.0"
+version = "1.0.1"
 authors = ["marius851000 <mariusdavid@laposte.net>"]
 edition = "2018"
 description = "A library allowing to use just a part of a Read + Seek object"

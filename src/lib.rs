@@ -14,8 +14,13 @@
 //TODO: impl stream_len when seek_convenience is stabilized
 
 use std::io;
-use std::io::{Read, Seek, Write, Cursor, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
+
+const ERROR_MESSAGE_SEEK_PRE_START: &str = "can't seek before the beggining of the partition";
+const ERROR_MESSAGE_OVERFLOW_POSITION_UNSIGNED: &str = "position cant be more than 2^64.";
+const ERROR_MESSAGE_OVERFLOW_POSITION_SIGNED: &str = "position cant be more than 2^63.";
+const ERROR_MESSAGE_START_LENGHT_OVERFLOW: &str = "the sum of the input start + lenght is superior to the maximum representatble value in a 64 bit number.";
 
 fn partition_read<T: Read + Seek>(
     buf: &mut [u8],
@@ -28,11 +33,25 @@ fn partition_read<T: Read + Seek>(
     if !seek_is_correct {
         match file.seek(SeekFrom::Start(pointer)) {
             Ok(_) => (),
-            Err(err) => return(pointer, Err(err))
+            Err(err) => return (pointer, Err(err)),
         }
     }
-    let end_byte_absolute = pointer + buf.len() as u64;
+    let end_byte_absolute = match pointer.checked_add(buf.len() as u64) {
+        Some(value) => value,
+        None => {
+            return (
+                pointer,
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    ERROR_MESSAGE_OVERFLOW_POSITION_UNSIGNED,
+                )),
+            )
+        }
+    };
     if end_byte_absolute >= end {
+        if end < pointer {
+            return (pointer, Ok(0));
+        };
         let loop_total_nb = end - pointer;
         let mut buffer1 = [0];
 
@@ -51,7 +70,7 @@ fn partition_read<T: Read + Seek>(
     } else {
         match file.read(buf) {
             Ok(value) => (pointer + value as u64, Ok(value)),
-            Err(err) => (pointer, Err(err))
+            Err(err) => (pointer, Err(err)),
         }
     }
 }
@@ -63,21 +82,64 @@ fn partition_seek<T: Read + Seek>(
     pointer: u64,
     target: SeekFrom,
 ) -> (u64, io::Result<u64>) {
-    const ERROR_MESSAGE_SEEK_PRE_START: &str = "can't seek before the beggining of the partition";
-
     let new_real_pos: u64 = match target {
-        SeekFrom::Start(nb) => start + nb,
+        SeekFrom::Start(nb) => match start.checked_add(nb) {
+            Some(position) => position,
+            None => {
+                return (
+                    pointer,
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        ERROR_MESSAGE_OVERFLOW_POSITION_UNSIGNED,
+                    )),
+                )
+            }
+        },
         SeekFrom::End(nb) => {
-            let result_i64 = end as i64 + nb;
+            let result_i64 = match (end as i64).checked_add(nb) {
+                Some(position) => position,
+                None => {
+                    return (
+                        pointer,
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            ERROR_MESSAGE_OVERFLOW_POSITION_SIGNED,
+                        )),
+                    )
+                }
+            };
             if result_i64 < start as i64 {
-                return (pointer, Err(io::Error::new(io::ErrorKind::InvalidInput, ERROR_MESSAGE_SEEK_PRE_START)))
+                return (
+                    pointer,
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        ERROR_MESSAGE_SEEK_PRE_START,
+                    )),
+                );
             };
             result_i64 as u64
         }
         SeekFrom::Current(nb) => {
-            let result_i64 = pointer as i64 + nb;
+            let result_i64 = match (pointer as i64).checked_add(nb) {
+                Some(position) => position,
+                None => {
+                    return (
+                        pointer,
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            ERROR_MESSAGE_OVERFLOW_POSITION_SIGNED,
+                        )),
+                    )
+                }
+            };
             if result_i64 < start as i64 {
-                return (pointer, Err(io::Error::new(io::ErrorKind::InvalidInput, ERROR_MESSAGE_SEEK_PRE_START)))
+                return (
+                    pointer,
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        ERROR_MESSAGE_SEEK_PRE_START,
+                    )),
+                );
             };
             result_i64 as u64
         }
@@ -147,7 +209,7 @@ impl<T: Read + Seek> Partition<T> {
             file,
             start,
             pointer: start,
-            end: start + lenght,
+            end: start.checked_add(lenght).ok_or(io::Error::new(io::ErrorKind::InvalidInput, ERROR_MESSAGE_START_LENGHT_OVERFLOW))?,
         };
         result.seek(SeekFrom::Start(0))?;
         Ok(result)
@@ -156,7 +218,14 @@ impl<T: Read + Seek> Partition<T> {
 
 impl<T: Read + Seek> Read for Partition<T> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let (new_pointer_pos, result) = partition_read(buf, &mut self.file, self.start, self.end, self.pointer, true);
+        let (new_pointer_pos, result) = partition_read(
+            buf,
+            &mut self.file,
+            self.start,
+            self.end,
+            self.pointer,
+            true,
+        );
         self.pointer = new_pointer_pos;
         result
     }
@@ -164,7 +233,8 @@ impl<T: Read + Seek> Read for Partition<T> {
 
 impl<T: Seek + Read> Seek for Partition<T> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let (new_pointer_pos, result) = partition_seek(&mut self.file, self.start, self.end, self.pointer, pos);
+        let (new_pointer_pos, result) =
+            partition_seek(&mut self.file, self.start, self.end, self.pointer, pos);
         self.pointer = new_pointer_pos;
         result
     }
@@ -241,7 +311,7 @@ impl<T: Read + Seek> PartitionMutex<T> {
             file,
             start,
             pointer: start,
-            end: start + lenght,
+            end:start.checked_add(lenght).ok_or(io::Error::new(io::ErrorKind::InvalidInput, ERROR_MESSAGE_START_LENGHT_OVERFLOW))?,
         };
         result.seek(SeekFrom::Start(0))?;
         Ok(result)
@@ -259,7 +329,8 @@ impl<T: Read + Seek> Read for PartitionMutex<T> {
                 ))
             }
         };
-        let (new_pointer_pos, result) = partition_read(buf, &mut *file, self.start, self.end, self.pointer, false);
+        let (new_pointer_pos, result) =
+            partition_read(buf, &mut *file, self.start, self.end, self.pointer, false);
         self.pointer = new_pointer_pos;
         result
     }
@@ -276,7 +347,8 @@ impl<T: Read + Seek> Seek for PartitionMutex<T> {
                 ))
             }
         };
-        let (new_pointer_pos, result) = partition_seek(&mut *file, self.start, self.end, self.pointer, target);
+        let (new_pointer_pos, result) =
+            partition_seek(&mut *file, self.start, self.end, self.pointer, target);
         self.pointer = new_pointer_pos;
         result
     }
@@ -295,7 +367,11 @@ impl<T: Read + Seek> Write for PartitionMutex<T> {
 }
 
 /// Clone a part of a file into a Vec
-pub fn clone_into_vec<T: Read + Seek>(file: &mut T, start: u64, length: u64) -> Result<Vec<u8>, io::Error> {
+pub fn clone_into_vec<T: Read + Seek>(
+    file: &mut T,
+    start: u64,
+    length: u64,
+) -> Result<Vec<u8>, io::Error> {
     let mut buffer = [0];
     file.seek(SeekFrom::Start(start))?;
     let mut output_buffer = Vec::new();
@@ -307,6 +383,10 @@ pub fn clone_into_vec<T: Read + Seek>(file: &mut T, start: u64, length: u64) -> 
 }
 
 /// Clone a part of a file
-pub fn partition_clone<T: Read + Seek>(file: &mut T, start: u64, length: u64) -> Result<Cursor<Vec<u8>>, io::Error> {
+pub fn partition_clone<T: Read + Seek>(
+    file: &mut T,
+    start: u64,
+    length: u64,
+) -> Result<Cursor<Vec<u8>>, io::Error> {
     Ok(Cursor::new(clone_into_vec(file, start, length)?))
 }
