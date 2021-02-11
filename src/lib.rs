@@ -13,9 +13,10 @@
 //! ```
 //TODO: impl stream_len when seek_convenience is stabilized
 
-use std::io;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
+use std::{io, sync::MutexGuard};
+use thiserror::Error;
 
 const ERROR_MESSAGE_SEEK_PRE_START: &str = "can't seek before the beggining of the partition";
 const ERROR_MESSAGE_OVERFLOW_POSITION_UNSIGNED: &str = "position cant be more than 2^64.";
@@ -161,6 +162,14 @@ fn partition_seek<T: Read + Seek>(
     (new_real_pos, Ok(new_real_pos - start))
 }
 
+fn check_seek_end_valid<T: Read + Seek>(partition: &mut T) -> io::Result<()> {
+    partition.seek(SeekFrom::End(0))?;
+    let mut buf = [];
+    partition.read_exact(&mut buf)?;
+    partition.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
 /// A ``Partition`` allow you to refer to a part of the file. It consume the input file.
 ///
 /// The input offset is the first byte that will be accessible. The user of the ``Partition`` won't be able to seek before it, and it will be considered the offset 0 of the ``Partition``
@@ -209,9 +218,12 @@ impl<T: Read + Seek> Partition<T> {
             file,
             start,
             pointer: start,
-            end: start.checked_add(lenght).ok_or(io::Error::new(io::ErrorKind::InvalidInput, ERROR_MESSAGE_START_LENGHT_OVERFLOW))?,
+            end: start.checked_add(lenght).ok_or_else(|| io::Error::new(
+                io::ErrorKind::InvalidInput,
+                ERROR_MESSAGE_START_LENGHT_OVERFLOW,
+            ))?,
         };
-        result.seek(SeekFrom::Start(0))?;
+        check_seek_end_valid(&mut result)?;
         Ok(result)
     }
 }
@@ -241,7 +253,7 @@ impl<T: Seek + Read> Seek for Partition<T> {
 }
 
 impl<T: Read + Seek> Write for Partition<T> {
-    /// Do not use this write function. It will panic. It is just here because some library require this to have the ``Write`` trait to make this work with this (rust_vfs)
+    /// Do not use this write function. It will always fail. It is just here because some library require this to have the ``Write`` trait to make this work with this (rust_vfs)
     fn write(&mut self, _: &[u8]) -> io::Result<usize> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
@@ -252,6 +264,15 @@ impl<T: Read + Seek> Write for Partition<T> {
     }
 }
 
+#[derive(Debug, Error)]
+/// An error that may occur by calling [`PartitionMutex::lock`]
+pub enum LockPartitionError {
+    #[error("an io error occured")]
+    IOError(#[from] io::Error),
+    #[error("A thread panicked while holding this lock")]
+    PoisonError,
+}
+
 /// A ``PartitionMutex`` allow you to refer to a part of the file. It consume the input file.
 ///
 /// As the input file is an ``Arc<Mutex<_>>``, multiple ``PartitionMutex`` can be created by file, and ``PartitionMutex`` can be cloned.
@@ -259,15 +280,17 @@ impl<T: Read + Seek> Write for Partition<T> {
 /// The input offset is the first byte that will be accessible. The user of the ``PartitionMutex`` won't be able to seek before it, and it will be considered the offset 0 of the ``PartitionMutex``
 /// The input lenght is the number of byte that can be read with this ``PartitionMutex``. The last readable byte from the input file is input_offset + input_len
 ///
+/// It is possible to lock the mutex with [`PartitionMutex::lock`]. You need to take care when using it, or a panic may occur. Please read the documentation of the function. 
+///
 /// # Examples
-/// ```compile_fail
+/// ```
 /// use std::io::{Cursor, Read, Seek, SeekFrom};
 /// use io_partition::PartitionMutex;
 /// use std::sync::{Mutex, Arc};
 /// use std::thread;
 ///
-/// let some_value = (0..100).collect::<Vec<u8>>();
-/// let some_file = Arc::new(Mutex::new(Cursor::new(&some_value))); // does not compile due to some_value not being owned by Cursor. Work with everything with a 'static lifetime (including ``std::file::File``).
+/// let mut some_value = (0..100).collect::<Vec<u8>>();
+/// let some_file = Arc::new(Mutex::new(Cursor::new(some_value)));
 ///
 /// let mut first_partition = PartitionMutex::new(some_file.clone(), 10, 20).unwrap();
 /// let mut second_partition = PartitionMutex::new(some_file.clone(), 40, 30).unwrap();
@@ -290,11 +313,19 @@ impl<T: Read + Seek> Write for Partition<T> {
 ///     buf[0]
 /// });
 ///
-/// second_partition.seek(SeekFrom::End(0)).unwrap();
+/// second_partition.seek(SeekFrom::End(-1)).unwrap();
 /// second_partition.read_exact(&mut buf).unwrap();
 ///
 /// assert_eq!(handle.join().unwrap(), 47);
-/// assert_eq!(buf[0], 70);
+/// assert_eq!(buf[0], 69);
+///
+/// first_partition.seek(SeekFrom::Start(2)).unwrap();
+/// {
+///     let mut locked = first_partition.lock().unwrap();
+///     let mut buffer = [0; 2];
+///     locked.read_exact(&mut buffer);
+///     assert_eq!(&buffer, &[12, 13]);
+/// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct PartitionMutex<T: Read + Seek> {
@@ -311,10 +342,31 @@ impl<T: Read + Seek> PartitionMutex<T> {
             file,
             start,
             pointer: start,
-            end:start.checked_add(lenght).ok_or(io::Error::new(io::ErrorKind::InvalidInput, ERROR_MESSAGE_START_LENGHT_OVERFLOW))?,
+            end: start.checked_add(lenght).ok_or_else(|| io::Error::new(
+                io::ErrorKind::InvalidInput,
+                ERROR_MESSAGE_START_LENGHT_OVERFLOW,
+            ))?,
         };
         result.seek(SeekFrom::Start(0))?;
         Ok(result)
+    }
+
+    /// Lock this [`PartitionMutex`], in a similar fashion to [`Mutex::lock`].
+    /// If the same thread lock this [`PartitionMutex`], or any other structure that use the same file, without first checking it is free, it might panic or softlock.
+    /// Note that the seek/read implementation of [`PartitionMutex`] will lock the file for the duration of those function execution.
+    /// you can use scope for this.
+    pub fn lock(&mut self) -> Result<PartitionMutexLock<'_, T>, LockPartitionError> {
+        let mut file_locked = self
+            .file
+            .lock()
+            .map_err(|_| LockPartitionError::PoisonError)?;
+        file_locked.seek(SeekFrom::Start(self.pointer))?;
+        Ok(PartitionMutexLock {
+            file: file_locked,
+            pointer: &mut self.pointer,
+            start: &mut self.start,
+            end: &mut self.end,
+        })
     }
 }
 
@@ -343,7 +395,7 @@ impl<T: Read + Seek> Seek for PartitionMutex<T> {
             Err(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    "the fie mutex is poisoned",
+                    "the file mutex is poisoned",
                 ))
             }
         };
@@ -355,7 +407,51 @@ impl<T: Read + Seek> Seek for PartitionMutex<T> {
 }
 
 impl<T: Read + Seek> Write for PartitionMutex<T> {
-    /// Do not use this write function. It will panic. It is just here because some library require this to have the ``Write`` trait to make this work with this (rust_vfs)
+    /// Do not use this write function. It will always fail. It is just here because some library require this to have the ``Write`` trait to make this work with this (rust_vfs)
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+
+    /// Always suceed. It is useless to call it
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A locked [`PartitionMutex`]. See the documentation of [`PartitionMutex::lock`] for usage precaution.
+pub struct PartitionMutexLock<'a, T: Read + Seek> {
+    file: MutexGuard<'a, T>, // NOTE: we assume the file is seeked at the right position
+    start: &'a mut u64,
+    pointer: &'a mut u64,
+    end: &'a mut u64,
+}
+
+impl<'a, T: Read + Seek> Read for PartitionMutexLock<'a, T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let (new_pointer_pos, result) = partition_read(
+            buf,
+            &mut *self.file,
+            *self.start,
+            *self.end,
+            *self.pointer,
+            true,
+        );
+        *self.pointer = new_pointer_pos;
+        result
+    }
+}
+
+impl<'a, T: Read + Seek> Seek for PartitionMutexLock<'a, T> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let (new_pointer_pos, result) =
+            partition_seek(&mut *self.file, *self.start, *self.end, *self.pointer, pos);
+        *self.pointer = new_pointer_pos;
+        result
+    }
+}
+
+impl<'a, T: Read + Seek> Write for PartitionMutexLock<'a, T> {
+    /// Do not use this write function. It will always fail. It is just here because some library require this to have the ``Write`` trait to make this work with this (rust_vfs)
     fn write(&mut self, _: &[u8]) -> io::Result<usize> {
         Err(io::Error::from(io::ErrorKind::PermissionDenied))
     }
